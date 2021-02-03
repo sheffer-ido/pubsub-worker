@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/rs/xid"
 	logger "github.com/sheffer-ido/pubsub-worker/com/logger"
+	safe "github.com/sheffer-ido/pubsub-worker/com/safe"
 	pb "github.com/sheffer-ido/pubsub-worker/com/src/proto"
 	"google.golang.org/grpc"
 )
@@ -21,11 +22,12 @@ import (
 var (
 	port string = "5005"
 	id   string = "myserver"
+	log  *logger.Logger
 )
 
 func main() {
 
-	log := logger.NewLogger("machine")
+	log = logger.NewLogger("machine")
 
 	//fill env params
 
@@ -51,38 +53,72 @@ func main() {
 	signal.Notify(gracefulShutdown, syscall.SIGINT)
 	signal.Notify(gracefulShutdown, syscall.SIGQUIT)
 
-	//check keepalive
-	connected := false
+	//General safe bollean status for container health refrance
+	grpcStatus := safe.SafeHealth{}
+	grpcStatus.Set(false)
 
-	//set pod keepalive
-	go func(bool) {
+	//srv container health route (depending on grpcStatus)
+	go func(*safe.SafeHealth) {
 		http.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-			if connected == false {
+			if grpcStatus.GetStatus() == false {
 				http.Error(w, "not connected to server", http.StatusInternalServerError)
 			}
 			fmt.Fprint(w, "i feel good")
 		},
 		)
 		http.ListenAndServe(":9001", nil)
-	}(connected)
+	}(&grpcStatus)
 
-	conn, err := ReDial(port, 0)
+	//context for rpc bidi loop functions
+	ctx := context.Background()
+
+	//synced array of processing request with no replay from server
+	requests := &safe.SafeMap{}
+
+	//Open bidi client stream
+	openStream(ctx, port, &grpcStatus, requests)
+
+	log.Errorf("finsih")
+
+}
+
+// open Stream -- when failed recursion itself
+func openStream(ctx context.Context, port string, health *safe.SafeHealth, requests *safe.SafeMap) error {
+
+	//if the dial fails the port is taken and it will return error
+	conn, err := grpc.Dial(":"+port, grpc.WithInsecure())
 	if err != nil {
-		log.Fatalf("%s", err.Error())
-		return
+		log.Fatalf("can not connect with server %v", err)
+		return err
 	}
 
 	// create stream
 	client := pb.NewDuplexClient(conn)
-	stream, err := client.StreamRequest(context.Background())
+
+	//connect to server will trey 3 times  with 3 second interval and exit if fails will issue a Stream again with new Dial
+	stream, err := streamRequest(ctx, client, health, 0)
 	if err != nil {
-		log.Fatalf("openn stream error %v", err)
-		return
+		time.Sleep(time.Second * 5)
+		return openStream(ctx, port, health, requests)
 	}
 
+	//when connected will start send requests
+	stremOperation(stream, health, requests)
+	log.Errorf("finsih")
+
+	//when stream fails a reconnect will occur
+	return openStream(ctx, port, health, requests)
+
+}
+
+func stremOperation(stream pb.Duplex_StreamRequestClient, health *safe.SafeHealth, requests *safe.SafeMap) {
+	//stream context will be done when connection fails
 	ctx := stream.Context()
+
 	done := make(chan bool)
 
+	//health requests to the server to report status of machine
+	//health response from the server will be handled by the response loop
 	healthCounter := 0
 	go func() {
 		for {
@@ -92,56 +128,53 @@ func main() {
 				Meta: "health",
 				Time: time.Now().Unix(),
 			}
-			// generate random nummber and send it to stream
 
 			if err := stream.Send(in); err != nil {
 				log.Fatalf("can not send %v", err)
-				/*
-						conn, err := ReDial(port, 0)
-					if err != nil {
-						log.Fatalf("%s", err.Error())
-						return
-					}
-					client = pb.NewStreamServiceClient(conn)
-				*/
+				health.Set(false)
+				ctx.Done()
+				return
 			}
 			log.Printf("%v sent", in)
 			select {
-			case <-gracefulShutdown:
-				log.Fatal("closing")
-				return
 			default:
 				time.Sleep(time.Second * 1)
 			}
 		}
 	}()
-	// first goroutine sends random increasing numbers to stream
-	// and closes int after 10 iterations
+
+	//Re send the processed requests had no status from server
+	for _, r := range requests.GetAll() {
+		requests.Add(r.Id, r)
+		if err := stream.Send(r); err != nil {
+			log.Fatalf("can not send %v", err)
+			continue
+		}
+		requests.Remove(r.Id)
+	}
+
+	///fake loop to generate messages
 	go func() {
 		counter := 0
 		for {
 			counter++
 			in := generateRequest(counter)
 			// generate random nummber and send it to stream
-
+			requests.Add(in.Id, in)
 			if err := stream.Send(in); err != nil {
 				log.Fatalf("can not send %v", err)
+				ctx.Done()
+				return
 			}
 			log.Printf("%v sent", in)
 			select {
-			case <-gracefulShutdown:
-				log.Fatal("closing")
-				return
 			default:
 				time.Sleep(time.Second * 5)
 			}
 		}
 	}()
 
-	// second goroutine receives data from stream
-	// and saves result in max variable
-	//
-	// if stream is finished it closes done channel
+	//responses loop to handle server responses
 	go func() {
 		for {
 
@@ -152,12 +185,16 @@ func main() {
 			}
 			if err != nil {
 				log.Fatalf("can not receive %v", err)
-				connected = false
-				continue
+				health.Set(false)
+				ctx.Done()
+				return
 			}
 			if resp.Meta == "health" {
-				connected = true
+				health.Set(true)
+				continue
 			}
+
+			requests.Remove(resp.RequestId)
 
 			log.Debugf("received type %s, id: %d, duration:%d sec", resp.Meta, resp.RequestId, (resp.Time - resp.RequestTime))
 		}
@@ -176,20 +213,20 @@ func main() {
 	<-done
 }
 
-func ReDial(port string, counter int) (*grpc.ClientConn, error) {
-	conn, err := grpc.Dial(":"+port, grpc.WithInsecure())
+func streamRequest(ctx context.Context, client pb.DuplexClient, grpcStatus *safe.SafeHealth, counter int) (pb.Duplex_StreamRequestClient, error) {
+	stream, err := client.StreamRequest(ctx)
 	if err != nil {
-		log.Fatalf("can not connect with server %v", err)
+		log.Fatalf("open stream error %v", err)
+		grpcStatus.Set(false)
+		counter++
 		if counter < 3 {
-			counter++
-			time.Sleep(time.Second * 1)
-			ReDial(port, counter)
+			time.Sleep(time.Second * 3)
+			return streamRequest(ctx, client, grpcStatus, counter)
 		} else {
 			return nil, fmt.Errorf("counter has reached 3 times")
 		}
 	}
-	return conn, nil
-
+	return stream, nil
 }
 
 func generateRequest(i int) *pb.Request {
